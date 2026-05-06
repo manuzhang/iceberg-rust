@@ -208,6 +208,8 @@ impl From<MapType> for Type {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
 #[serde(rename_all = "lowercase", remote = "Self")]
 pub enum PrimitiveType {
+    /// Default / null column type used when a more specific type is not known.
+    Unknown,
     /// True or False
     Boolean,
     /// 32-bit signed integer
@@ -364,6 +366,7 @@ where S: Serializer {
 impl fmt::Display for PrimitiveType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            PrimitiveType::Unknown => write!(f, "unknown"),
             PrimitiveType::Boolean => write!(f, "boolean"),
             PrimitiveType::Int => write!(f, "int"),
             PrimitiveType::Long => write!(f, "long"),
@@ -869,6 +872,7 @@ mod tests {
     {
         "type": "struct",
         "fields": [
+            {"id": 17, "name": "unknown_field", "required": false, "type": "unknown"},
             {"id": 1, "name": "bool_field", "required": true, "type": "boolean"},
             {"id": 2, "name": "int_field", "required": true, "type": "int"},
             {"id": 3, "name": "long_field", "required": true, "type": "long"},
@@ -893,6 +897,12 @@ mod tests {
             record,
             Type::Struct(StructType {
                 fields: vec![
+                    NestedField::optional(
+                        17,
+                        "unknown_field",
+                        Type::Primitive(PrimitiveType::Unknown),
+                    )
+                    .into(),
                     NestedField::required(1, "bool_field", Type::Primitive(PrimitiveType::Boolean))
                         .into(),
                     NestedField::required(2, "int_field", Type::Primitive(PrimitiveType::Int))
@@ -1274,6 +1284,8 @@ mod tests {
         for (ty, literal) in pairs {
             assert!(ty.compatible(&literal));
         }
+
+        assert!(!PrimitiveType::Unknown.compatible(&PrimitiveLiteral::Int(1)));
     }
 
     #[test]

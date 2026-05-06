@@ -127,6 +127,10 @@ impl SchemaBuilder {
 
     /// Builds the schema.
     pub fn build(self) -> Result<Schema> {
+        for field in &self.fields {
+            Self::validate_unknown_type_field(field)?;
+        }
+
         let field_id_to_accessor = self.build_accessors();
 
         let r#struct = StructType::new(self.fields);
@@ -182,6 +186,38 @@ impl SchemaBuilder {
         }
 
         Ok(schema)
+    }
+
+    fn validate_unknown_type_field(field: &NestedFieldRef) -> Result<()> {
+        match field.field_type.as_ref() {
+            Type::Primitive(PrimitiveType::Unknown) => {
+                ensure_data_valid!(
+                    !field.required,
+                    "Field {} cannot be required because unknown type must be optional",
+                    field.name
+                );
+                ensure_data_valid!(
+                    field.initial_default.is_none() && field.write_default.is_none(),
+                    "Field {} cannot have non-null defaults because unknown type requires null defaults",
+                    field.name
+                );
+            }
+            Type::Struct(struct_type) => {
+                for nested_field in struct_type.fields() {
+                    Self::validate_unknown_type_field(nested_field)?;
+                }
+            }
+            Type::List(list_type) => {
+                Self::validate_unknown_type_field(&list_type.element_field)?;
+            }
+            Type::Map(map_type) => {
+                Self::validate_unknown_type_field(&map_type.key_field)?;
+                Self::validate_unknown_type_field(&map_type.value_field)?;
+            }
+            Type::Primitive(_) => {}
+        }
+
+        Ok(())
     }
 
     fn build_accessors(&self) -> HashMap<i32, Arc<StructAccessor>> {
@@ -1226,6 +1262,47 @@ table {
                 ])
                 .build()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn test_unknown_type_must_be_optional_with_null_defaults() {
+        assert!(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "empty", Primitive(PrimitiveType::Unknown)).into()
+                ])
+                .build()
+                .is_ok()
+        );
+
+        let required_error = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "empty", Primitive(PrimitiveType::Unknown)).into(),
+            ])
+            .build()
+            .unwrap_err();
+        assert!(
+            required_error
+                .message()
+                .contains("unknown type must be optional")
+        );
+
+        let default_error = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::optional(1, "empty", Primitive(PrimitiveType::Unknown))
+                    .with_initial_default(Literal::int(1))
+                    .into(),
+            ])
+            .build()
+            .unwrap_err();
+        assert!(
+            default_error
+                .message()
+                .contains("unknown type requires null defaults")
         );
     }
 }
