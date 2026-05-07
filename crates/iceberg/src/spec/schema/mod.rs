@@ -1266,6 +1266,51 @@ table {
     }
 
     #[test]
+    fn test_unknown_type_deserialization_rejects_non_null_default() {
+        let schema_json = serde_json::json!({
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "empty",
+                    "required": false,
+                    "type": "unknown",
+                    "initial-default": 1
+                }
+            ]
+        });
+
+        let error = serde_json::from_value::<Schema>(schema_json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not match any variant of untagged enum SchemaEnum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_type_deserialization_accepts_null_defaults() {
+        let schema_json = serde_json::json!({
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "empty",
+                    "required": false,
+                    "type": "unknown",
+                    "initial-default": null,
+                    "write-default": null
+                }
+            ]
+        });
+
+        serde_json::from_value::<Schema>(schema_json).unwrap();
+    }
+
+    #[test]
     fn test_unknown_type_must_be_optional_with_null_defaults() {
         assert!(
             Schema::builder()
