@@ -566,20 +566,45 @@ struct SerdeNestedField {
     pub write_default: Option<JsonValue>,
 }
 
+fn parse_field_default(
+    default: Option<JsonValue>,
+    field_type: &Type,
+    field_name: &str,
+    default_name: &'static str,
+) -> Result<Option<Literal>> {
+    default
+        .map(|value| {
+            Literal::try_from_json(value, field_type).map_err(|err| {
+                crate::Error::new(
+                    err.kind(),
+                    format!(
+                        "Invalid {default_name} for field {field_name}: {}",
+                        err.message()
+                    ),
+                )
+                .with_source(err)
+            })
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
 impl TryFrom<SerdeNestedField> for NestedField {
     type Error = crate::Error;
 
     fn try_from(value: SerdeNestedField) -> Result<Self> {
-        let initial_default = value
-            .initial_default
-            .map(|x| Literal::try_from_json(x, &value.field_type))
-            .transpose()?
-            .flatten();
-        let write_default = value
-            .write_default
-            .map(|x| Literal::try_from_json(x, &value.field_type))
-            .transpose()?
-            .flatten();
+        let initial_default = parse_field_default(
+            value.initial_default,
+            &value.field_type,
+            &value.name,
+            "initial-default",
+        )?;
+        let write_default = parse_field_default(
+            value.write_default,
+            &value.field_type,
+            &value.name,
+            "write-default",
+        )?;
 
         Ok(NestedField {
             id: value.id,

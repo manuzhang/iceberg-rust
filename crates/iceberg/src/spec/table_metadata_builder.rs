@@ -640,6 +640,7 @@ impl TableMetadataBuilder {
     pub fn add_schema(mut self, schema: Schema) -> Result<Self> {
         // Validate that new schema fields don't conflict with existing partition field names
         self.validate_schema_field_names(&schema)?;
+        self.validate_schema_format_version(&schema)?;
 
         let new_schema_id = self.reuse_or_create_new_schema_id(&schema);
         let schema_found = self.metadata.schemas.contains_key(&new_schema_id);
@@ -757,6 +758,20 @@ impl TableMetadataBuilder {
                     ),
                 ));
             }
+        }
+
+        Ok(())
+    }
+
+    fn validate_schema_format_version(&self, schema: &Schema) -> Result<()> {
+        if self.metadata.format_version < FormatVersion::V3 && schema.contains_unknown_type() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add schema with unknown type to table format version {}: unknown type is only supported in v3",
+                    self.metadata.format_version
+                ),
+            ));
         }
 
         Ok(())
@@ -1488,6 +1503,16 @@ mod tests {
             .unwrap()
     }
 
+    fn schema_with_unknown_type() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "x", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "unknown", Type::Primitive(PrimitiveType::Unknown)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
     fn sort_order() -> SortOrder {
         let schema = schema();
         SortOrder::builder()
@@ -1526,6 +1551,39 @@ mod tests {
         .into_builder(Some(
             "s3://bucket/test/location/metadata/metadata1.json".to_string(),
         ))
+    }
+
+    #[test]
+    fn test_unknown_type_requires_format_version_v3() {
+        let v2_error = TableMetadataBuilder::new(
+            schema_with_unknown_type(),
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            v2_error
+                .message()
+                .contains("unknown type is only supported in v3"),
+            "unexpected error: {v2_error}"
+        );
+
+        let v3_metadata = TableMetadataBuilder::new(
+            schema_with_unknown_type(),
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            TEST_LOCATION.to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        assert_eq!(v3_metadata.format_version(), FormatVersion::V3);
     }
 
     #[test]

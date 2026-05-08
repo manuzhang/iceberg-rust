@@ -412,6 +412,14 @@ impl Schema {
         &self.r#struct
     }
 
+    /// Returns true when this schema contains an `unknown` type field.
+    pub(crate) fn contains_unknown_type(&self) -> bool {
+        self.as_struct()
+            .fields()
+            .iter()
+            .any(field_contains_unknown_type)
+    }
+
     /// Returns [`identifier_field_ids`].
     #[inline]
     pub fn identifier_field_ids(&self) -> impl ExactSizeIterator<Item = i32> + '_ {
@@ -454,6 +462,19 @@ impl Schema {
     /// Return a hashmap matching field ids to nested fields.
     pub fn field_id_to_fields(&self) -> &HashMap<i32, NestedFieldRef> {
         &self.id_to_field
+    }
+}
+
+fn field_contains_unknown_type(field: &NestedFieldRef) -> bool {
+    match field.field_type.as_ref() {
+        Type::Primitive(PrimitiveType::Unknown) => true,
+        Type::Struct(struct_type) => struct_type.fields().iter().any(field_contains_unknown_type),
+        Type::List(list_type) => field_contains_unknown_type(&list_type.element_field),
+        Type::Map(map_type) => {
+            field_contains_unknown_type(&map_type.key_field)
+                || field_contains_unknown_type(&map_type.value_field)
+        }
+        Type::Primitive(_) => false,
     }
 }
 
@@ -1266,28 +1287,46 @@ table {
     }
 
     #[test]
-    fn test_unknown_type_deserialization_rejects_non_null_default() {
-        let schema_json = serde_json::json!({
-            "type": "struct",
-            "schema-id": 1,
-            "fields": [
-                {
-                    "id": 1,
-                    "name": "empty",
-                    "required": false,
-                    "type": "unknown",
-                    "initial-default": 1
-                }
-            ]
-        });
+    fn test_unknown_type_deserialization_rejects_non_null_defaults() {
+        for default_name in ["initial-default", "write-default"] {
+            let field_json = serde_json::json!({
+                "id": 1,
+                "name": "empty",
+                "required": false,
+                "type": "unknown",
+                default_name: 1
+            });
 
-        let error = serde_json::from_value::<Schema>(schema_json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("did not match any variant of untagged enum SchemaEnum"),
-            "unexpected error: {error}"
-        );
+            let field_error = serde_json::from_value::<NestedField>(field_json).unwrap_err();
+            assert!(
+                field_error
+                    .to_string()
+                    .contains(&format!("Invalid {default_name} for field empty")),
+                "unexpected error for {default_name}: {field_error}"
+            );
+
+            let schema_json = serde_json::json!({
+                "type": "struct",
+                "schema-id": 1,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "empty",
+                        "required": false,
+                        "type": "unknown",
+                        default_name: 1
+                    }
+                ]
+            });
+
+            let schema_error = serde_json::from_value::<Schema>(schema_json).unwrap_err();
+            assert!(
+                schema_error
+                    .to_string()
+                    .contains("did not match any variant of untagged enum SchemaEnum"),
+                "unexpected error for {default_name}: {schema_error}"
+            );
+        }
     }
 
     #[test]

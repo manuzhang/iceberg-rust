@@ -527,6 +527,7 @@ impl TableMetadata {
     /// should return normalized `TableMetadata`.
     pub(super) fn try_normalize(&mut self) -> Result<&mut Self> {
         self.validate_current_schema()?;
+        self.validate_schema_format_versions()?;
         self.normalize_current_snapshot()?;
         self.construct_refs();
         self.validate_refs()?;
@@ -538,6 +539,24 @@ impl TableMetadata {
         self.try_normalize_partition_spec()?;
         self.try_normalize_sort_order()?;
         Ok(self)
+    }
+
+    fn validate_schema_format_versions(&self) -> Result<()> {
+        if self.format_version < FormatVersion::V3
+            && let Some(schema_id) = self
+                .schemas
+                .iter()
+                .find_map(|(schema_id, schema)| schema.contains_unknown_type().then_some(schema_id))
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Schema {schema_id} contains unknown type, which is only supported in table format version v3"
+                ),
+            ));
+        }
+
+        Ok(())
     }
 
     /// If the default partition spec is not present in specs, add it
