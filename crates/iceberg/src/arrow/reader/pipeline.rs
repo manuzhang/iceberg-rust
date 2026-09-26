@@ -43,7 +43,7 @@ use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::encryption::StandardKeyMetadata;
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bloom_filter_evaluator::{
     BloomFilterEvaluator, ColumnBloomFilter, collect_bloom_filter_field_ids,
@@ -200,7 +200,7 @@ impl FileScanTaskReader {
             } else {
                 // Branch 3: No name mapping - use position-based fallback IDs
                 // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
-                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
+                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema(), task.schema())?
             };
 
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
@@ -408,7 +408,8 @@ impl FileScanTaskReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_position_fallback(use_position_fallback);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -475,12 +476,9 @@ impl FileScanTaskReader {
                     // inheritance a committed entry always has one, so this is a malformed
                     // manifest rather than a legitimate null.
                     (Some(_), None) => {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Data file {} has a first_row_id but no data sequence number",
-                                task.data_file_path()
-                            ),
+                        return Err(invalid_data!(
+                            "Data file {} has a first_row_id but no data sequence number",
+                            task.data_file_path()
                         ));
                     }
                 };
@@ -604,6 +602,7 @@ impl FileScanTaskReader {
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 &predicate,
+                task.schema(),
                 use_position_fallback,
             )?;
 
