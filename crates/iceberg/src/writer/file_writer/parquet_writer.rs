@@ -20,7 +20,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_array::{
+    Array, ArrayRef, ListArray, MapArray, RecordBatch, RecordBatchOptions, StructArray,
+};
+use arrow_schema::{DataType, FieldRef, Fields, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use itertools::Itertools;
@@ -29,14 +32,17 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::encryption::encrypt::FileEncryptionProperties;
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
+use parquet::geospatial::bounding_box::BoundingBox;
+use parquet_geospatial::interval::{Interval, IntervalTrait, WraparoundInterval};
 
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
-    get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
+    get_field_id_from_metadata, get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
+    schema_to_arrow_schema, schema_to_arrow_schema_for_parquet_write,
 };
 use crate::compression::CompressionCodec;
 use crate::encryption::{EncryptionManager, StandardKeyMetadata};
@@ -44,14 +50,20 @@ use crate::error::invalid_data;
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
-    NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
-    StructType, TableMetadata, TableProperties, Type, VariantType, visit_schema,
+    NestedFieldRef, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef,
+    SchemaVisitor, Struct, StructType, TableMetadata, TableProperties, Type, VariantType,
+    visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
 
-/// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
+/// Builds a [`ParquetWriter`] for an Iceberg schema.
+///
+/// Input batches use the logical Iceberg schema. Before writing, [`ParquetWriter`] projects each
+/// batch to the physical Parquet schema and omits [`PrimitiveType::Unknown`] fields. Building the
+/// writer fails when omission would leave no valid physical representation, such as an all-unknown
+/// schema or an unknown list element or map key/value.
 #[derive(Clone, Debug)]
 pub struct ParquetWriterBuilder {
     props: WriterProperties,
@@ -171,14 +183,332 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             resolve_writer_properties(self.props.clone(), key_metadata.as_ref())?;
         Ok(ParquetWriter {
             schema: self.schema.clone(),
+            table_arrow_schema: Arc::new(schema_to_arrow_schema(&self.schema)?),
+            parquet_arrow_schema: Arc::new(schema_to_arrow_schema_for_parquet_write(&self.schema)?),
+            match_mode: self.match_mode,
+            cached_projection: None,
             inner_writer: None,
             writer_properties,
             current_row_num: 0,
             output_file,
-            nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            nan_value_count_visitor: NanValueCountVisitor::new(),
             key_metadata,
         })
     }
+}
+
+fn find_field_index(
+    fields: &Fields,
+    target: &FieldRef,
+    match_mode: FieldMatchMode,
+) -> Result<Option<usize>> {
+    match match_mode {
+        FieldMatchMode::Id => {
+            let target_id = get_field_id_from_metadata(target)?;
+            for (index, field) in fields.iter().enumerate() {
+                if get_field_id_from_metadata(field)? == target_id {
+                    return Ok(Some(index));
+                }
+            }
+            Ok(None)
+        }
+        FieldMatchMode::Name => Ok(fields
+            .iter()
+            .position(|field| field.name() == target.name())),
+    }
+}
+
+/// Validate a source field against its full logical Iceberg field before projection.
+/// Unknown fields must use Arrow Null. List elements and map keys/values are all checked because
+/// removing one would change the shape of its container rather than omit a regular struct field.
+fn validate_source_field_for_parquet_write(
+    source: &FieldRef,
+    target: &FieldRef,
+    match_mode: FieldMatchMode,
+) -> Result<()> {
+    match (source.data_type(), target.data_type()) {
+        (DataType::Null, DataType::Null) => Ok(()),
+        (source_type, DataType::Null) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Expected unknown field {} to use Arrow Null type, got {source_type}",
+                source.name()
+            ),
+        )),
+        (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+            validate_source_fields_for_parquet_write(source_fields, target_fields, match_mode)
+        }
+        (DataType::List(source_element), DataType::List(target_element)) => {
+            // A list has one positional element. Its Arrow name may be `item` or `element`;
+            // only ID mode requires an explicit identity check.
+            if matches!(match_mode, FieldMatchMode::Id)
+                && get_field_id_from_metadata(source_element)?
+                    != get_field_id_from_metadata(target_element)?
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "List element field {} does not match configured field {} for Parquet write",
+                        source_element.name(),
+                        target_element.name()
+                    ),
+                ));
+            }
+            validate_source_field_for_parquet_write(source_element, target_element, match_mode)
+        }
+        (DataType::Map(source_entries, _), DataType::Map(target_entries, _)) => {
+            match (source_entries.data_type(), target_entries.data_type()) {
+                (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+                    validate_source_fields_for_parquet_write(
+                        source_fields,
+                        target_fields,
+                        match_mode,
+                    )
+                }
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_source_fields_for_parquet_write(
+    source_fields: &Fields,
+    target_fields: &Fields,
+    match_mode: FieldMatchMode,
+) -> Result<()> {
+    let mut matched_targets = vec![false; target_fields.len()];
+    for source_field in source_fields {
+        let Some(target_index) = find_field_index(target_fields, source_field, match_mode)? else {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Field {} is not present in the configured Iceberg schema for Parquet write",
+                    source_field.name()
+                ),
+            ));
+        };
+        if matched_targets[target_index] {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Multiple source fields match configured field {} for Parquet write",
+                    target_fields[target_index].name()
+                ),
+            ));
+        }
+        matched_targets[target_index] = true;
+        validate_source_field_for_parquet_write(
+            source_field,
+            &target_fields[target_index],
+            match_mode,
+        )?;
+    }
+    Ok(())
+}
+
+/// Array operations chosen once for a particular incoming Arrow schema.
+enum ArrayProjection {
+    Identity,
+    Struct(Vec<(usize, ArrayProjection)>),
+    List(Box<ArrayProjection>),
+    Map(Box<ArrayProjection>),
+}
+
+impl ArrayProjection {
+    fn new(source: &FieldRef, target: &FieldRef, match_mode: FieldMatchMode) -> Result<Self> {
+        if source.data_type() == target.data_type() {
+            return Ok(Self::Identity);
+        }
+
+        match (source.data_type(), target.data_type()) {
+            (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+                let columns = target_fields
+                    .iter()
+                    .map(|target_field| {
+                        let index = find_field_index(source_fields, target_field, match_mode)?
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "Field {} is missing from struct array for Parquet write",
+                                        target_field.name()
+                                    ),
+                                )
+                            })?;
+                        Ok((
+                            index,
+                            Self::new(&source_fields[index], target_field, match_mode)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Self::Struct(columns))
+            }
+            (DataType::List(source_element), DataType::List(target_element)) => Ok(Self::List(
+                Box::new(Self::new(source_element, target_element, match_mode)?),
+            )),
+            (DataType::Map(source_entries, _), DataType::Map(target_entries, _)) => Ok(Self::Map(
+                Box::new(Self::new(source_entries, target_entries, match_mode)?),
+            )),
+            (source_type, target_type) => Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot project Arrow type {source_type} to {target_type} for Parquet field {}",
+                    target.name()
+                ),
+            )),
+        }
+    }
+
+    fn project(&self, array: &ArrayRef, target: &FieldRef) -> Result<ArrayRef> {
+        match self {
+            Self::Identity => Ok(array.clone()),
+            Self::Struct(columns) => {
+                let source = array
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "Expected struct array for Parquet write",
+                        )
+                    })?;
+                let DataType::Struct(target_fields) = target.data_type() else {
+                    unreachable!();
+                };
+                let projected = columns
+                    .iter()
+                    .zip(target_fields.iter())
+                    .map(|((index, projection), field)| {
+                        projection.project(source.column(*index), field)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(StructArray::try_new_with_length(
+                    target_fields.clone(),
+                    projected,
+                    source.nulls().cloned(),
+                    source.len(),
+                )?))
+            }
+            Self::List(element_projection) => {
+                let source = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Expected list array for Parquet write",
+                    )
+                })?;
+                let DataType::List(target_element) = target.data_type() else {
+                    unreachable!();
+                };
+                let values = element_projection.project(source.values(), target_element)?;
+                Ok(Arc::new(ListArray::try_new(
+                    target_element.clone(),
+                    source.offsets().clone(),
+                    values,
+                    source.nulls().cloned(),
+                )?))
+            }
+            Self::Map(entries_projection) => {
+                let source = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Expected map array for Parquet write",
+                    )
+                })?;
+                let DataType::Map(target_entries_field, ordered) = target.data_type() else {
+                    unreachable!();
+                };
+                let source_entries: ArrayRef = Arc::new(source.entries().clone());
+                let entries = entries_projection.project(&source_entries, target_entries_field)?;
+                let entries = entries
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Projected Parquet map entries are not a struct array",
+                        )
+                    })?
+                    .clone();
+                Ok(Arc::new(MapArray::try_new(
+                    target_entries_field.clone(),
+                    source.offsets().clone(),
+                    entries,
+                    source.nulls().cloned(),
+                    *ordered,
+                )?))
+            }
+        }
+    }
+}
+
+struct BatchProjection {
+    source_schema: ArrowSchemaRef,
+    columns: Vec<(usize, ArrayProjection)>,
+}
+
+impl BatchProjection {
+    fn new(
+        source_schema: ArrowSchemaRef,
+        logical_schema: &ArrowSchemaRef,
+        target_schema: &ArrowSchemaRef,
+        match_mode: FieldMatchMode,
+    ) -> Result<Self> {
+        validate_source_fields_for_parquet_write(
+            source_schema.fields(),
+            logical_schema.fields(),
+            match_mode,
+        )?;
+        let columns = target_schema
+            .fields()
+            .iter()
+            .map(|target_field| {
+                let index = find_field_index(source_schema.fields(), target_field, match_mode)?
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Field {} is missing from record batch for Parquet write",
+                                target_field.name()
+                            ),
+                        )
+                    })?;
+                Ok((
+                    index,
+                    ArrayProjection::new(&source_schema.fields()[index], target_field, match_mode)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            source_schema,
+            columns,
+        })
+    }
+
+    fn project(&self, batch: &RecordBatch, target_schema: ArrowSchemaRef) -> Result<RecordBatch> {
+        let columns = self
+            .columns
+            .iter()
+            .zip(target_schema.fields().iter())
+            .map(|((index, projection), field)| projection.project(batch.column(*index), field))
+            .collect::<Result<Vec<_>>>()?;
+        let options = RecordBatchOptions::default().with_row_count(Some(batch.num_rows()));
+        RecordBatch::try_new_with_options(target_schema, columns, &options).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+fn project_batch_for_parquet_write(
+    batch: &RecordBatch,
+    logical_schema: ArrowSchemaRef,
+    target_schema: ArrowSchemaRef,
+    match_mode: FieldMatchMode,
+) -> Result<RecordBatch> {
+    if batch.schema_ref() == &target_schema {
+        return Ok(batch.clone());
+    }
+    BatchProjection::new(batch.schema(), &logical_schema, &target_schema, match_mode)?
+        .project(batch, target_schema)
 }
 
 /// A mapping from Parquet column path names to internal field id
@@ -303,9 +633,21 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 }
 
-/// `ParquetWriter`` is used to write arrow data into parquet file on storage.
+/// Writes logical Iceberg Arrow batches to a Parquet file.
+///
+/// The input batches are matched to the configured Iceberg schema by field ID by default, or by
+/// name when configured through [`ParquetWriterBuilder::with_match_mode`]. In ID mode, every input
+/// field must contain valid Iceberg field-ID metadata. Fields with
+/// [`PrimitiveType::Unknown`] are accepted in logical input batches and omitted from the physical
+/// Parquet file.
 pub struct ParquetWriter {
     schema: SchemaRef,
+    /// Arrow schema converted from the full Iceberg table schema.
+    table_arrow_schema: ArrowSchemaRef,
+    /// Arrow schema projected to fields with a Parquet physical representation.
+    parquet_arrow_schema: ArrowSchemaRef,
+    match_mode: FieldMatchMode,
+    cached_projection: Option<BatchProjection>,
     output_file: OutputFile,
     inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
     writer_properties: WriterProperties,
@@ -318,7 +660,82 @@ pub struct ParquetWriter {
 struct MinMaxColAggregator {
     lower_bounds: HashMap<i32, Datum>,
     upper_bounds: HashMap<i32, Datum>,
+    // None means at least one non-null row group has no bounding box: file bounds are unknown.
+    geo_bounds: HashMap<i32, (PrimitiveType, Option<GeospatialBounds>)>,
     schema: SchemaRef,
+}
+
+struct GeospatialBounds {
+    x: WraparoundInterval,
+    y: Interval,
+    z: Interval,
+    m: Interval,
+}
+
+impl From<&BoundingBox> for GeospatialBounds {
+    fn from(bbox: &BoundingBox) -> Self {
+        Self {
+            x: WraparoundInterval::new(bbox.get_xmin(), bbox.get_xmax()),
+            y: Interval::new(bbox.get_ymin(), bbox.get_ymax()),
+            z: bbox
+                .get_zmin()
+                .zip(bbox.get_zmax())
+                .map(|(lo, hi)| Interval::new(lo, hi))
+                .unwrap_or_else(Interval::empty),
+            m: bbox
+                .get_mmin()
+                .zip(bbox.get_mmax())
+                .map(|(lo, hi)| Interval::new(lo, hi))
+                .unwrap_or_else(Interval::empty),
+        }
+    }
+}
+
+impl GeospatialBounds {
+    fn merge(&mut self, bbox: &BoundingBox) {
+        let other = Self::from(bbox);
+        self.x = self.x.merge_interval(&other.x);
+        self.y.update_interval(&other.y);
+        self.z.update_interval(&other.z);
+        self.m.update_interval(&other.m);
+    }
+
+    fn into_datums(self, ty: PrimitiveType) -> (Datum, Datum) {
+        let (xmin, xmax) = if matches!(ty, PrimitiveType::Geography(_)) {
+            // A full interval union uses infinities; Geography requires canonical longitudes.
+            (self.x.lo().max(-180.0), self.x.hi().min(180.0))
+        } else if self.x.is_wraparound() {
+            // Parquet permits wrapping geometry boxes; Iceberg only permits wrapping geography.
+            (f64::NEG_INFINITY, f64::INFINITY)
+        } else {
+            (self.x.lo(), self.x.hi())
+        };
+        let dimensions = if !self.m.is_empty() {
+            4
+        } else if !self.z.is_empty() {
+            3
+        } else {
+            2
+        };
+        let (zmin, zmax) = if self.z.is_empty() {
+            (f64::NAN, f64::NAN)
+        } else {
+            (self.z.lo(), self.z.hi())
+        };
+        // Iceberg bound serialization is XY[Z[M]] doubles, not WKB (spec Appendix D).
+        let encode = |point: [f64; 4]| {
+            PrimitiveLiteral::Binary(
+                point[..dimensions]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            )
+        };
+        (
+            Datum::new(ty.clone(), encode([xmin, self.y.lo(), zmin, self.m.lo()])),
+            Datum::new(ty, encode([xmax, self.y.hi(), zmax, self.m.hi()])),
+        )
+    }
 }
 
 impl MinMaxColAggregator {
@@ -327,6 +744,7 @@ impl MinMaxColAggregator {
         Self {
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
+            geo_bounds: HashMap::new(),
             schema,
         }
     }
@@ -353,8 +771,8 @@ impl MinMaxColAggregator {
             .or_insert(datum);
     }
 
-    /// Update statistics
-    fn update(&mut self, field_id: i32, value: &Statistics) -> Result<()> {
+    /// Update bounds from a column chunk.
+    fn update(&mut self, field_id: i32, column: &ColumnChunkMetaData) -> Result<()> {
         let Some(ty) = self
             .schema
             .field_by_id(field_id)
@@ -364,12 +782,46 @@ impl MinMaxColAggregator {
             // Ignore the field if it is not in schema.
             return Ok(());
         };
-        let Type::Primitive(ty) = ty.clone() else {
+        let Type::Primitive(ty) = ty else {
             return Err(Error::new(
                 ErrorKind::Unexpected,
                 format!("Composed type {ty} is not supported for min max aggregation."),
             ));
         };
+
+        match ty {
+            PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                // Null-only row groups do not contribute coordinates.
+                if column.num_values() == 0
+                    || column
+                        .statistics()
+                        .and_then(Statistics::null_count_opt)
+                        .is_some_and(|nulls| nulls == column.num_values() as u64)
+                {
+                    return Ok(());
+                }
+                // Parquet bounds already account for the logical type's edge interpolation.
+                let bbox = column
+                    .geo_statistics()
+                    .and_then(|stats| stats.bounding_box());
+                self.geo_bounds
+                    .entry(field_id)
+                    .and_modify(|(_, state)| {
+                        if let (Some(bounds), Some(bbox)) = (state.as_mut(), bbox) {
+                            bounds.merge(bbox);
+                        } else {
+                            *state = None;
+                        }
+                    })
+                    .or_insert_with(|| (ty.clone(), bbox.map(GeospatialBounds::from)));
+                return Ok(());
+            }
+            _ => {}
+        }
+        let Some(value) = column.statistics() else {
+            return Ok(());
+        };
+        let ty = ty.clone();
 
         if value.min_is_exact() {
             let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, value)? else {
@@ -379,7 +831,10 @@ impl MinMaxColAggregator {
                 ));
             };
 
-            self.update_state_min(field_id, min_datum);
+            // Iceberg bounds must not be NaN.
+            if !min_datum.is_nan() {
+                self.update_state_min(field_id, min_datum);
+            }
         }
 
         if value.max_is_exact() {
@@ -390,14 +845,23 @@ impl MinMaxColAggregator {
                 ));
             };
 
-            self.update_state_max(field_id, max_datum);
+            if !max_datum.is_nan() {
+                self.update_state_max(field_id, max_datum);
+            }
         }
 
         Ok(())
     }
 
     /// Returns lower and upper bounds
-    fn produce(self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+    fn produce(mut self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+        for (field_id, (ty, bounds)) in self.geo_bounds {
+            if let Some(bounds) = bounds {
+                let (lower, upper) = bounds.into_datums(ty);
+                self.lower_bounds.insert(field_id, lower);
+                self.upper_bounds.insert(field_id, upper);
+            }
+        }
         (self.lower_bounds, self.upper_bounds)
     }
 }
@@ -475,12 +939,13 @@ impl ParquetWriter {
                     *per_col_val_num.entry(field_id).or_insert(0) +=
                         column_chunk_metadata.num_values() as u64;
 
-                    if let Some(statistics) = column_chunk_metadata.statistics() {
-                        if let Some(null_count) = statistics.null_count_opt() {
-                            *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
-                        }
+                    min_max_agg.update(field_id, column_chunk_metadata)?;
 
-                        min_max_agg.update(field_id, statistics)?;
+                    if let Some(null_count) = column_chunk_metadata
+                        .statistics()
+                        .and_then(Statistics::null_count_opt)
+                    {
+                        *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
                     }
                 }
             }
@@ -606,28 +1071,44 @@ fn resolve_writer_properties(
 }
 
 impl FileWriter for ParquetWriter {
-    async fn write(&mut self, batch: &arrow_array::RecordBatch) -> Result<()> {
+    async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         // Skip empty batch
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        self.current_row_num += batch.num_rows();
-
-        let batch_c = batch.clone();
-        self.nan_value_count_visitor
-            .compute(self.schema.clone(), batch_c)?;
+        let batch = if batch.schema_ref() == &self.parquet_arrow_schema {
+            batch.clone()
+        } else {
+            let source_schema = batch.schema();
+            let same_schema = self.cached_projection.as_ref().is_some_and(|projection| {
+                Arc::ptr_eq(&projection.source_schema, &source_schema)
+                    || projection.source_schema == source_schema
+            });
+            if !same_schema {
+                self.cached_projection = Some(BatchProjection::new(
+                    source_schema,
+                    &self.table_arrow_schema,
+                    &self.parquet_arrow_schema,
+                    self.match_mode,
+                )?);
+            }
+            self.cached_projection
+                .as_ref()
+                .expect("projection initialized above")
+                .project(batch, self.parquet_arrow_schema.clone())?
+        };
+        self.nan_value_count_visitor.compute(&batch)?;
 
         // Lazy initialize the writer
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
                 async_writer,
-                arrow_schema.clone(),
+                self.parquet_arrow_schema.clone(),
                 Some(self.writer_properties.clone()),
             )
             .map_err(|err| {
@@ -638,13 +1119,15 @@ impl FileWriter for ParquetWriter {
             self.inner_writer.as_mut().unwrap()
         };
 
-        writer.write(batch).await.map_err(|err| {
+        writer.write(&batch).await.map_err(|err| {
             Error::new(
                 ErrorKind::Unexpected,
                 "Failed to write using parquet writer.",
             )
             .with_source(err)
         })?;
+
+        self.current_row_num += batch.num_rows();
 
         Ok(())
     }
@@ -749,28 +1232,32 @@ mod tests {
 
     use anyhow::Result;
     use arrow_array::builder::{Float32Builder, Int32Builder, MapBuilder};
-    use arrow_array::types::{Float32Type, Int64Type};
+    use arrow_array::types::{Float32Type, Int32Type, Int64Type};
     use arrow_array::{
         Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, ListArray, MapArray, RecordBatch, StructArray,
+        Int64Array, ListArray, MapArray, NullArray, RecordBatch, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+    use parquet::basic::{
+        BrotliLevel, Compression, EdgeInterpolationAlgorithm, GzipLevel, LogicalType, ZstdLevel,
+    };
     use parquet::file::statistics::ValueStatistics;
     use parquet::schema::types::ColumnPath;
+    use parquet_geospatial::testing::wkb_point_xy;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
     use crate::Runtime;
-    use crate::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
+    use crate::arrow::ArrowReaderBuilder;
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskStream};
     use crate::spec::decimal_utils::{decimal_mantissa, decimal_new, decimal_scale};
+    use crate::spec::geospatial::EdgeInterpolationAlgorithm as IcebergEdgeInterpolationAlgorithm;
     use crate::spec::{PrimitiveLiteral, Struct, *};
     use crate::test_utils::make_encryption_manager;
     use crate::writer::file_writer::location_generator::{
@@ -837,6 +1324,381 @@ mod tests {
             ])
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_project_batch_for_parquet_omits_unknown_fields() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "unknown", PrimitiveType::Unknown).into(),
+                NestedField::optional(
+                    2,
+                    "struct",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "unknown", PrimitiveType::Unknown).into(),
+                        NestedField::optional(4, "known", PrimitiveType::Int).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let source_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let DataType::Struct(struct_fields) = source_schema.field(1).data_type() else {
+            panic!("expected struct field");
+        };
+        let struct_array = Arc::new(StructArray::new(
+            struct_fields.clone(),
+            vec![
+                Arc::new(NullArray::new(2)),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+            ],
+            None,
+        ));
+        let batch = RecordBatch::try_new(source_schema.clone(), vec![
+            Arc::new(NullArray::new(2)),
+            struct_array,
+        ])
+        .unwrap();
+        let logical_schema = source_schema.clone();
+        let target_schema = Arc::new(schema_to_arrow_schema_for_parquet_write(&schema).unwrap());
+
+        let projected = project_batch_for_parquet_write(
+            &batch,
+            logical_schema,
+            target_schema,
+            FieldMatchMode::Id,
+        )
+        .unwrap();
+
+        assert_eq!(projected.num_rows(), 2);
+        assert_eq!(projected.num_columns(), 1);
+        let projected_struct = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(projected_struct.num_columns(), 1);
+        assert_eq!(projected_struct.fields()[0].name(), "known");
+
+        let mut nan_visitor = NanValueCountVisitor::new();
+        nan_visitor.compute(&projected).unwrap();
+        assert!(nan_visitor.nan_value_counts.is_empty());
+    }
+
+    #[test]
+    fn test_project_batch_for_parquet_honors_name_match_mode() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "known", PrimitiveType::Int).into(),
+            ])
+            .build()
+            .unwrap();
+        let source_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("known", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(source_schema, vec![Arc::new(Int32Array::from(vec![10]))])
+            .unwrap();
+        let logical_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let target_schema = Arc::new(schema_to_arrow_schema_for_parquet_write(&schema).unwrap());
+
+        let projected = project_batch_for_parquet_write(
+            &batch,
+            logical_schema,
+            target_schema,
+            FieldMatchMode::Name,
+        )
+        .unwrap();
+
+        assert_eq!(projected.num_columns(), 1);
+        let values = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 10);
+    }
+
+    #[test]
+    fn test_project_batch_for_parquet_rejects_unexpected_fields() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "known", PrimitiveType::Int).into(),
+                NestedField::optional(
+                    2,
+                    "struct",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "unknown", PrimitiveType::Unknown).into(),
+                        NestedField::optional(4, "known", PrimitiveType::Int).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let logical_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let target_schema = Arc::new(schema_to_arrow_schema_for_parquet_write(&schema).unwrap());
+        let DataType::Struct(logical_struct_fields) = logical_schema.field(1).data_type() else {
+            panic!("expected struct field");
+        };
+        let logical_struct = Arc::new(StructArray::new(
+            logical_struct_fields.clone(),
+            vec![
+                Arc::new(NullArray::new(1)),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+            None,
+        ));
+        let unexpected_field = Field::new("unexpected", DataType::Int32, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "5".to_string())]),
+        );
+
+        let top_level_batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                logical_schema.field(0).clone(),
+                logical_schema.field(1).clone(),
+                unexpected_field.clone(),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                logical_struct.clone(),
+                Arc::new(Int32Array::from(vec![20])),
+            ],
+        )
+        .unwrap();
+
+        let mut source_struct_fields: Vec<FieldRef> =
+            logical_struct_fields.iter().cloned().collect();
+        source_struct_fields.push(Arc::new(unexpected_field));
+        let source_struct_fields: Fields = source_struct_fields.into();
+        let source_struct = Arc::new(StructArray::new(
+            source_struct_fields.clone(),
+            vec![
+                Arc::new(NullArray::new(1)),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![20])),
+            ],
+            None,
+        ));
+        let source_struct_field = logical_schema
+            .field(1)
+            .clone()
+            .with_data_type(DataType::Struct(source_struct_fields));
+        let nested_batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                logical_schema.field(0).clone(),
+                source_struct_field,
+            ])),
+            vec![Arc::new(Int32Array::from(vec![1])), source_struct],
+        )
+        .unwrap();
+
+        for match_mode in [FieldMatchMode::Id, FieldMatchMode::Name] {
+            for batch in [&top_level_batch, &nested_batch] {
+                let error = project_batch_for_parquet_write(
+                    batch,
+                    logical_schema.clone(),
+                    target_schema.clone(),
+                    match_mode,
+                )
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("is not present in the configured Iceberg schema"),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_project_batch_for_parquet_validates_list_element_identity() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "list",
+                    Type::List(ListType::new(
+                        NestedField::list_element(2, PrimitiveType::Int, false).into(),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let logical_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let target_schema = Arc::new(schema_to_arrow_schema_for_parquet_write(&schema).unwrap());
+        let DataType::List(target_element) = logical_schema.field(0).data_type() else {
+            panic!("expected list field");
+        };
+        let elements = [
+            (
+                Arc::new(
+                    Field::new(
+                        target_element.name(),
+                        target_element.data_type().clone(),
+                        target_element.is_nullable(),
+                    )
+                    .with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "3".to_string(),
+                    )])),
+                ),
+                FieldMatchMode::Id,
+                true,
+            ),
+            (
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                FieldMatchMode::Name,
+                false,
+            ),
+        ];
+
+        for (source_element, match_mode, should_fail) in elements {
+            let list_parts =
+                ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(10)])])
+                    .into_parts();
+            let list_array = Arc::new(ListArray::new(
+                source_element.clone(),
+                list_parts.1,
+                list_parts.2,
+                list_parts.3,
+            ));
+            let source_field = logical_schema
+                .field(0)
+                .clone()
+                .with_data_type(DataType::List(source_element));
+            let batch = RecordBatch::try_new(
+                Arc::new(arrow_schema::Schema::new(vec![source_field])),
+                vec![list_array],
+            )
+            .unwrap();
+
+            let result = project_batch_for_parquet_write(
+                &batch,
+                logical_schema.clone(),
+                target_schema.clone(),
+                match_mode,
+            );
+            if should_fail {
+                let error = result.expect_err("mismatched list element ID must fail");
+                assert_eq!(
+                    error.message(),
+                    "List element field element does not match configured field element for Parquet write"
+                );
+            } else {
+                let projected = result.expect("name mode accepts the Arrow item name");
+                assert_eq!(projected.schema(), target_schema);
+            }
+        }
+    }
+
+    #[test]
+    fn test_project_batch_for_parquet_rejects_invalid_field_id_metadata() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "known", PrimitiveType::Int).into(),
+            ])
+            .build()
+            .unwrap();
+        let target_schema = Arc::new(schema_to_arrow_schema_for_parquet_write(&schema).unwrap());
+        let logical_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+
+        let cases = [
+            (
+                Field::new("known", DataType::Int32, true),
+                "Field id not found in metadata",
+            ),
+            (
+                Field::new("known", DataType::Int32, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "invalid".to_string(),
+                )])),
+                "Failed to parse field id",
+            ),
+        ];
+
+        for (field, expected_message) in cases {
+            let batch =
+                RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![
+                    Arc::new(Int32Array::from(vec![10])),
+                ])
+                .unwrap();
+
+            let error = project_batch_for_parquet_write(
+                &batch,
+                logical_schema.clone(),
+                target_schema.clone(),
+                FieldMatchMode::Id,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected_message),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_reuses_projection_after_rejected_batch() -> Result<()> {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "known", PrimitiveType::Int).into(),
+                    NestedField::optional(2, "unknown", PrimitiveType::Unknown).into(),
+                ])
+                .build()?,
+        );
+        let logical_schema = schema_to_arrow_schema(&schema)?;
+        let extra = Field::new("extra", DataType::Int32, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "3".to_string(),
+        )]));
+        let invalid = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                logical_schema.field(0).clone(),
+                extra,
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![2])),
+            ],
+        )?;
+        let valid = RecordBatch::try_new(Arc::new(logical_schema), vec![
+            Arc::new(Int32Array::from(vec![3])),
+            Arc::new(NullArray::new(1)),
+        ])?;
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("data.parquet");
+        let output_file = FileIO::new_with_fs().new_output(path.to_str().unwrap())?;
+        let mut writer = ParquetWriterBuilder::new(WriterProperties::default(), schema)
+            .build(output_file)
+            .await?;
+
+        let err = writer
+            .write(&invalid)
+            .await
+            .expect_err("extra field must fail");
+        assert!(err.message().contains("Field extra is not present"));
+        assert_eq!(writer.current_row_num(), 0);
+        writer.write(&valid).await?;
+        writer.write(&valid).await?;
+        assert_eq!(writer.current_row_num(), 2);
+        let files = writer.close().await?;
+        assert_eq!(files.len(), 1);
+        let data_file = files
+            .into_iter()
+            .next()
+            .unwrap()
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()?;
+        assert_eq!(data_file.record_count(), 2);
+        Ok(())
     }
 
     fn nested_schema_for_test() -> Schema {
@@ -1372,7 +2234,7 @@ mod tests {
             None,
             Some("d"),
         ])) as ArrayRef;
-        let col6 = Arc::new(arrow_array::LargeBinaryArray::from_opt_vec(vec![
+        let col6 = Arc::new(arrow_array::BinaryArray::from_opt_vec(vec![
             Some(b"one"),
             None,
             Some(b""),
@@ -2565,9 +3427,378 @@ mod tests {
             (
                 parquet::basic::Type::FIXED_LEN_BYTE_ARRAY,
                 16,
-                Some(&parquet::basic::LogicalType::Uuid)
+                Some(&LogicalType::Uuid)
             )
         );
+    }
+
+    struct GeospatialTestFile {
+        temp_dir: TempDir,
+        file_io: FileIO,
+        schema: SchemaRef,
+        batch: RecordBatch,
+        data_file: DataFile,
+    }
+
+    async fn write_geospatial_test_file() -> Result<GeospatialTestFile> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let geom_type = PrimitiveType::Geometry(GeometryType::new(Some("srid:0".to_string()))?);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "geom", Type::Primitive(geom_type)).into(),
+                    NestedField::optional(
+                        2,
+                        "geog",
+                        Type::Primitive(PrimitiveType::Geography(GeographyType::new(
+                            None,
+                            IcebergEdgeInterpolationAlgorithm::Karney,
+                        )?)),
+                    )
+                    .into(),
+                ])
+                .build()?,
+        );
+        let geometry = [
+            parquet_geospatial::testing::wkb_point_xyzm(1.0, 20.0, f64::NAN, 40.0),
+            parquet_geospatial::testing::wkb_point_xyzm(-3.0, 4.0, f64::NAN, 70.0),
+        ];
+        let geography = wkb_point_xy(3.0, 4.0);
+        let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema)?), vec![
+            Arc::new(arrow_array::LargeBinaryArray::from_iter_values(&geometry)),
+            Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                Some(geography.as_slice()),
+                None,
+            ])),
+        ])?;
+        let output = file_io.new_output(temp_dir.path().join("geo.parquet").to_str().unwrap())?;
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut writer = ParquetWriterBuilder::new(props, schema.clone())
+            .build(output)
+            .await?;
+        writer.write(&batch).await?;
+        let data_file = writer
+            .close()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        Ok(GeospatialTestFile {
+            temp_dir,
+            file_io,
+            schema,
+            batch,
+            data_file,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_geospatial_parquet_roundtrip() -> Result<()> {
+        let file = write_geospatial_test_file().await?;
+        let input = file.file_io.new_input(file.data_file.file_path())?;
+        let mut parquet_reader =
+            ArrowFileReader::new(input.metadata().await?, input.reader().await?);
+        let metadata = parquet_reader.get_metadata(None).await?;
+        let schema_descr = metadata.file_metadata().schema_descr();
+        assert_eq!(metadata.num_row_groups(), 2);
+        let logical_types: Vec<_> = schema_descr
+            .columns()
+            .iter()
+            .map(|column| column.logical_type_ref())
+            .collect();
+        let expected = [
+            LogicalType::geometry(Some("srid:0".to_string())),
+            LogicalType::geography(None, Some(EdgeInterpolationAlgorithm::KARNEY)),
+        ];
+        assert_eq!(logical_types, expected.iter().map(Some).collect::<Vec<_>>());
+
+        let arrow_schema = parquet::arrow::parquet_to_arrow_schema(
+            schema_descr,
+            metadata.file_metadata().key_value_metadata(),
+        )?;
+        let unset_metadata: serde_json::Value =
+            serde_json::from_str(arrow_schema.field(0).extension_type_metadata().unwrap())?;
+        assert!(unset_metadata.get("crs").is_none());
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(file.data_file.file_size_in_bytes())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file.data_file.file_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(file.schema)
+            .with_project_field_ids(vec![1, 2])
+            .with_case_sensitive(false)
+            .build()?;
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let reader = ArrowReaderBuilder::new(file.file_io, Runtime::current()).build();
+        let batches: Vec<RecordBatch> = reader.read(tasks)?.stream().try_collect().await?;
+        let read_back = concat_batches(batches[0].schema_ref(), &batches)?;
+        assert_eq!(read_back.columns(), file.batch.columns());
+        Ok(())
+    }
+
+    fn coordinate_bytes(coordinates: &[f64]) -> Vec<u8> {
+        coordinates
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_geometry_bounds_manifest_roundtrip() -> Result<()> {
+        let file = write_geospatial_test_file().await?;
+        let path = file.temp_dir.path().join("manifest.avro");
+        let output = file.file_io.new_output(path.to_str().unwrap())?;
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(1),
+            file.schema.clone(),
+            PartitionSpec::builder(file.schema).build()?,
+        )
+        .build_v3_data();
+        writer.add_file(file.data_file, 1)?;
+        writer.write_manifest_file().await?;
+        let manifest = Manifest::parse_avro(&std::fs::read(path).unwrap())?;
+        let data_file = manifest.entries()[0].data_file();
+        let ty = PrimitiveType::Geometry(GeometryType::new(Some("srid:0".to_string()))?);
+        let expected_lower = HashMap::from([(
+            1,
+            Datum::new(
+                ty.clone(),
+                PrimitiveLiteral::Binary(coordinate_bytes(&[-3.0, 4.0, f64::NAN, 40.0])),
+            ),
+        )]);
+        let expected_upper = HashMap::from([(
+            1,
+            Datum::new(
+                ty,
+                PrimitiveLiteral::Binary(coordinate_bytes(&[1.0, 20.0, f64::NAN, 70.0])),
+            ),
+        )]);
+        assert_eq!(
+            (data_file.lower_bounds(), data_file.upper_bounds()),
+            (&expected_lower, &expected_upper),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_geometry_bounds_do_not_drive_scalar_metrics() -> Result<()> {
+        use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
+        use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+        use crate::expr::{Bind, Reference};
+
+        let file = write_geospatial_test_file().await?;
+        let values = file
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+            .unwrap();
+        let literal = Datum::try_from_bytes(
+            values.value(0),
+            file.schema
+                .field_by_id(1)
+                .unwrap()
+                .field_type
+                .as_primitive_type()
+                .unwrap()
+                .clone(),
+        )?;
+        let inequality = Reference::new("geom")
+            .less_than(literal.clone())
+            .bind(file.schema.clone(), true)?;
+        let exclusion = Reference::new("geom")
+            .not_equal_to(literal)
+            .bind(file.schema, true)?;
+        assert_eq!(
+            (
+                InclusiveMetricsEvaluator::eval(&inequality, &file.data_file, true)?,
+                StrictMetricsEvaluator::eval(&exclusion, &file.data_file)?,
+            ),
+            (true, false),
+        );
+        Ok(())
+    }
+
+    fn geometry_bound_bytes(bbox: BoundingBox) -> (Vec<u8>, Vec<u8>) {
+        let ty = PrimitiveType::Geometry(GeometryType::default());
+        let (lower, upper) = GeospatialBounds::from(&bbox).into_datums(ty);
+        (
+            lower.to_bytes().unwrap().into_vec(),
+            upper.to_bytes().unwrap().into_vec(),
+        )
+    }
+
+    #[test]
+    fn test_geometry_xy_bounds() {
+        assert_eq!(
+            geometry_bound_bytes(BoundingBox::new(-3.0, 1.0, 4.0, 20.0)),
+            (
+                coordinate_bytes(&[-3.0, 4.0]),
+                coordinate_bytes(&[1.0, 20.0])
+            ),
+        );
+    }
+
+    #[test]
+    fn test_geometry_xyz_bounds() {
+        assert_eq!(
+            geometry_bound_bytes(BoundingBox::new(-3.0, 1.0, 4.0, 20.0).with_zrange(2.0, 9.0)),
+            (
+                coordinate_bytes(&[-3.0, 4.0, 2.0]),
+                coordinate_bytes(&[1.0, 20.0, 9.0])
+            ),
+        );
+    }
+
+    #[test]
+    fn test_wrapping_geometry_bounds_cover_all_x() {
+        assert_eq!(
+            geometry_bound_bytes(BoundingBox::new(170.0, -170.0, -10.0, 10.0)),
+            (
+                coordinate_bytes(&[f64::NEG_INFINITY, -10.0]),
+                coordinate_bytes(&[f64::INFINITY, 10.0]),
+            ),
+        );
+    }
+
+    fn geospatial_stats_fixture(ty: PrimitiveType) -> (SchemaRef, ColumnChunkMetaData) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "geo", Type::Primitive(ty)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let parquet_schema = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&schema_to_arrow_schema(&schema).unwrap())
+            .unwrap();
+        let column = ColumnChunkMetaData::builder(parquet_schema.column(0))
+            .set_num_values(1)
+            .build()
+            .unwrap();
+        (schema, column)
+    }
+
+    fn with_geo_box(column: &ColumnChunkMetaData, bbox: BoundingBox) -> ColumnChunkMetaData {
+        use parquet::geospatial::statistics::GeospatialStatistics;
+        column
+            .clone()
+            .into_builder()
+            .set_geo_statistics(Box::new(GeospatialStatistics::new(Some(bbox), None)))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_geometry_bounds_merge_across_null_row_group() -> Result<()> {
+        let (schema, column) =
+            geospatial_stats_fixture(PrimitiveType::Geometry(GeometryType::default()));
+        let first = with_geo_box(
+            &column,
+            BoundingBox::new(-3.0, 1.0, 4.0, 20.0).with_zrange(4.0, 9.0),
+        );
+        let second = with_geo_box(
+            &column,
+            BoundingBox::new(0.0, 5.0, -20.0, 5.0).with_mrange(1.0, 3.0),
+        );
+        let nulls = column
+            .into_builder()
+            .set_statistics(Statistics::ByteArray(ValueStatistics::new(
+                None,
+                None,
+                None,
+                Some(1),
+                false,
+            )))
+            .build()?;
+        let mut bounds = MinMaxColAggregator::new(schema);
+        for column in [&first, &nulls, &second] {
+            bounds.update(1, column)?;
+        }
+        let (lower, upper) = bounds.produce();
+        assert_eq!(
+            (
+                lower[&1].to_bytes()?.into_vec(),
+                upper[&1].to_bytes()?.into_vec()
+            ),
+            (
+                coordinate_bytes(&[-3.0, -20.0, 4.0, 1.0]),
+                coordinate_bytes(&[5.0, 20.0, 9.0, 3.0])
+            ),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_geometry_bounds_require_all_non_null_row_groups() -> Result<()> {
+        let (schema, unknown) =
+            geospatial_stats_fixture(PrimitiveType::Geometry(GeometryType::default()));
+        let known = with_geo_box(&unknown, BoundingBox::new(1.0, 2.0, 3.0, 4.0));
+        let mut bounds = MinMaxColAggregator::new(schema);
+        for column in [&known, &unknown, &known] {
+            bounds.update(1, column)?;
+        }
+        assert_eq!(bounds.produce(), (HashMap::new(), HashMap::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_geography_bounds_merge_from_parquet_statistics() -> Result<()> {
+        let (schema, column) =
+            geospatial_stats_fixture(PrimitiveType::Geography(GeographyType::default()));
+        let first = with_geo_box(&column, BoundingBox::new(170.0, -170.0, -20.0, 20.0));
+        let second = with_geo_box(&column, BoundingBox::new(175.0, 178.0, -10.0, 30.0));
+        let mut bounds = MinMaxColAggregator::new(schema);
+        bounds.update(1, &first)?;
+        bounds.update(1, &second)?;
+        let (lower, upper) = bounds.produce();
+        assert_eq!(
+            (
+                lower[&1].to_bytes()?.into_vec(),
+                upper[&1].to_bytes()?.into_vec()
+            ),
+            (
+                coordinate_bytes(&[170.0, -20.0]),
+                coordinate_bytes(&[-170.0, 30.0])
+            ),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_geography_bounds_full_longitude_range() -> Result<()> {
+        let (schema, column) =
+            geospatial_stats_fixture(PrimitiveType::Geography(GeographyType::default()));
+        let first = with_geo_box(&column, BoundingBox::new(170.0, -170.0, -20.0, 20.0));
+        let second = with_geo_box(&column, BoundingBox::new(-175.0, 175.0, -10.0, 30.0));
+        let mut bounds = MinMaxColAggregator::new(schema);
+        bounds.update(1, &first)?;
+        bounds.update(1, &second)?;
+        let (lower, upper) = bounds.produce();
+        assert_eq!(
+            (
+                lower[&1].to_bytes()?.into_vec(),
+                upper[&1].to_bytes()?.into_vec()
+            ),
+            (
+                coordinate_bytes(&[-180.0, -20.0]),
+                coordinate_bytes(&[180.0, 30.0])
+            ),
+        );
+        Ok(())
     }
 
     #[test]
@@ -2583,9 +3814,18 @@ mod tests {
                 .build()
                 .expect("Failed to create schema"),
         );
+        let parquet_schema = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&schema_to_arrow_schema(&schema).unwrap())
+            .unwrap();
         let mut min_max_agg = MinMaxColAggregator::new(schema);
-        let create_statistics =
-            |min, max| Statistics::Int32(ValueStatistics::new(min, max, None, None, false));
+        let create_statistics = |min, max| {
+            ColumnChunkMetaData::builder(parquet_schema.column(0))
+                .set_statistics(Statistics::Int32(ValueStatistics::new(
+                    min, max, None, None, false,
+                )))
+                .build()
+                .unwrap()
+        };
         min_max_agg
             .update(0, &create_statistics(None, Some(42)))
             .unwrap();
@@ -2603,6 +3843,55 @@ mod tests {
 
         assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+    }
+
+    #[test]
+    fn test_min_max_aggregator_skips_nan_bounds() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "f", Type::Primitive(PrimitiveType::Float)).into(),
+                    NestedField::required(1, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .expect("Failed to create schema"),
+        );
+        let parquet_schema = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&schema_to_arrow_schema(&schema).unwrap())
+            .unwrap();
+        let mut min_max_agg = MinMaxColAggregator::new(schema);
+        let float_stats = |min, max| {
+            ColumnChunkMetaData::builder(parquet_schema.column(0))
+                .set_statistics(Statistics::Float(ValueStatistics::new(
+                    min, max, None, None, false,
+                )))
+                .build()
+                .unwrap()
+        };
+        let double_stats = |min, max| {
+            ColumnChunkMetaData::builder(parquet_schema.column(1))
+                .set_statistics(Statistics::Double(ValueStatistics::new(
+                    min, max, None, None, false,
+                )))
+                .build()
+                .unwrap()
+        };
+
+        min_max_agg
+            .update(0, &float_stats(Some(-f32::NAN), Some(f32::NAN)))
+            .unwrap();
+        min_max_agg
+            .update(0, &float_stats(Some(1.5), Some(2.5)))
+            .unwrap();
+        min_max_agg
+            .update(1, &double_stats(Some(f64::NAN), Some(f64::NAN)))
+            .unwrap();
+
+        let (lower_bounds, upper_bounds) = min_max_agg.produce();
+
+        assert_eq!(lower_bounds, HashMap::from([(0, Datum::float(1.5_f32))]));
+        assert_eq!(upper_bounds, HashMap::from([(0, Datum::float(2.5_f32))]));
     }
 
     fn cdc_test_schema() -> SchemaRef {
